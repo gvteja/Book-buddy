@@ -1,27 +1,25 @@
+import pickle
+import json
 from pyspark import SparkContext, StorageLevel
 from itertools import combinations
 from os import path
 from time import time
-import pickle
-import json
+from operator import add
 
-input_file = 'hdfs:/ratings/ratings_Electronics.csv.gz'
-interested_item = '1400599997'
+#input_file = 'reviews_Books.json.gz'
+input_file = 'sample_5p.json'
+interested_item = '0439023513'
 basename = path.basename(input_file)
 ts = str(int(time()))
 suffix = '_{0}_{1}'.format(basename, ts)
 sc = SparkContext(appName='Vj_CF' + suffix)
 
-def extractAsTuple(line):
-    user, item, rating, t = [x.strip() for x in line.split(',')]
-    return ((item, user), (float(rating), int(t)))
-
 def extractRating(line):
     obj = json.loads(line)
-    users = obj['reviewerID']
+    user = obj['reviewerID']
     item = obj['asin']
-    rating = obj['overall']
-    return (item, (user, float(rating)))
+    rating = float(obj['overall'])
+    return (item, (user, rating))
 
 def computeScore(tup, norms, interested_norm):
     item, (dot, _) = tup
@@ -57,23 +55,28 @@ def predictScore(tup, scores):
     predicted_score += interested_mean
     return [(user, predicted_score)]
 
-rdd = sc.textFile(input_file, minPartitions=8, use_unicode=False)
-item_user_map = rdd.map(extractAsTuple)\
-    .reduceByKey(lambda r1,r2: r1 if r1[1] > r2[1] else r2)\
-    .map(lambda x: ((x[0][0]), (x[0][1], x[1][0])))
+# Have verified that there are not duplicate (item, user) ratings in the source data
+# So avoiding a distinct here to save on time
+rdd = sc.textFile(input_file, minPartitions=8)
+item_user_map = rdd.map(extractRating)
 
 items_to_remove = item_user_map.map(lambda x: (x[0], 1))\
-    .reduceByKey(lambda x,y: x + y)\
+    .reduceByKey(add)\
     .filter(lambda x: x[1] < 25)
 item_user_map = item_user_map.subtractByKey(items_to_remove)
 
 user_item_map = item_user_map.map(lambda x: ((x[1][0]), (x[0], x[1][1])))
 users_to_remove = user_item_map.map(lambda x: (x[0], (x[1][1], 1)))\
-    .reduceByKey(lambda x,y: x + y)\
+    .reduceByKey(add)\
     .filter(lambda x: x[1] < 10)
 user_item_map = user_item_map.subtractByKey(users_to_remove)
 
 item_user_map = user_item_map.map(lambda x: ((x[1][0]), (x[0], x[1][1])))
+
+training, dev, test = item_user_map.randomSplit([7, 1, 2])
+
+# TODO: do another filtering to ensure that, there is enough data in training(+dev?) for every key, user in test 
+
 
 means = item_user_map.map(lambda x: (x[0], (x[1][1], 1.0)))\
     .reduceByKey(lambda x,y: ((x[0] + y[0]), (x[1] + y[1])))\
@@ -90,7 +93,7 @@ interested_mean = means[interested_item]
 # But is not really necessary for now since they anyway would be 0 cosine
 
 norms = item_user_map.map(lambda x: (x[0], x[1][1] ** 2))\
-    .reduceByKey(lambda x,y: x + y)\
+    .reduceByKey(add)\
     .map(lambda x: (x[0], x[1] ** 0.5))
 norms = sc.broadcast(norms.collectAsMap())
 
