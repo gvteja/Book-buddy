@@ -1,7 +1,7 @@
 import pickle
 import json
 from pyspark import SparkContext, StorageLevel
-from itertools import combinations
+from pyspark.mllib.recommendation import ALS
 from os import path
 from time import time
 from operator import add
@@ -73,9 +73,56 @@ user_item_map = user_item_map.subtractByKey(users_to_remove)
 
 item_user_map = user_item_map.map(lambda x: ((x[1][0]), (x[0], x[1][1])))
 
-training, dev, test = item_user_map.randomSplit([7, 1, 2])
+# Assign a unique integer id to all items and users
+# and build 2-way maps for translation
+items = item_user_map.keys().distinct().collect()
+item_names = {}
+item_ids = {}
+for i, item in enumerate(items):
+    item_names[i] = item
+    item_ids[item] = i
+item_names = sc.broadcast(item_names)
+item_ids = sc.broadcast(item_ids)
+
+users = user_item_map.keys().distinct().collect()
+user_names = {}
+user_ids = {}
+for i, user in enumerate(users):
+    user_names[i] = user
+    user_ids[user] = i
+user_names = sc.broadcast(user_names)
+user_ids = sc.broadcast(user_ids)
+
+# Make items and users None to make it eligible for garbage collection
+items = None
+users = None
+
+# ratings is RDD of (user_id, item_id, rating)
+ratings = item_user_map.map(lambda x:\
+    (user_ids.value[x[1][0]], item_ids.value[x[0]], x[1][1]))
+
+training, dev, test = ratings.randomSplit([7, 1, 2])
 
 # TODO: do another filtering to ensure that, there is enough data in training(+dev?) for every key, user in test 
+
+# TODO: optimize the hyperparams
+model = ALS.train(training, 10)
+
+predictions = model.predictAll(test.map(lambda x: (x[0], x[1])))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 means = item_user_map.map(lambda x: (x[0], (x[1][1], 1.0)))\
