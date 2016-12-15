@@ -2,6 +2,7 @@ import pickle
 import json
 from pyspark import SparkContext, StorageLevel
 from pyspark.mllib.recommendation import ALS
+from pyspark.mllib.evaluation import RegressionMetrics
 from os import path
 from time import time
 from operator import add
@@ -106,12 +107,16 @@ training, dev, test = ratings.randomSplit([7, 1, 2])
 # TODO: do another filtering to ensure that, there is enough data in training(+dev?) for every key, user in test 
 
 # TODO: optimize the hyperparams
-model = ALS.train(training, 10)
+model = ALS.train(training, 10, 20, 1)
 
 predictions = model.predictAll(test.map(lambda x: (x[0], x[1])))
 
-
-
+predictions_ratings = predictions.map(lambda x: ((x[0], x[1]), x[2])) \
+      .join(test.map(lambda x: ((x[0], x[1]), x[2]))) \
+      .values()
+metrics = RegressionMetrics(predictions_ratings)
+rmse = metrics.rootMeanSquaredError
+print rmse
 
 
 
