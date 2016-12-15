@@ -14,7 +14,7 @@ k = 5
 basename = path.basename(input_file)
 ts = str(int(time()))
 suffix = '_{0}_{1}'.format(basename, ts)
-sc = SparkContext(appName='CF_UI' + suffix)
+#sc = SparkContext(appName='CF_UI' + suffix)
 
 def extractRating(line):
     obj = json.loads(line)
@@ -80,7 +80,7 @@ setting_log = []
 hyper_params = {
     'rank':[5, 15, 25],
     'iterations':[20],
-    'lambda_': [0.1, 1, 10.0]
+    'lambda_': [0.1, 1.0, 10.0]
 }
 params = []
 for param, vals in hyper_params.iteritems():
@@ -100,6 +100,14 @@ for setting in itertools.product(*params):
         best_rmse = rmse
         best_setting = setting
 
+# Store all the things we want to pickle in this list
+to_pickle = []
+to_pickle.append(setting_log)
+to_pickle.append(best_setting)
+
+# Store all the info we want to print into results
+results = []
+
 # Train a new model using the best hyper-param setting and
 # using combined training + dev data as the new training data
 model = ALS.train(training.union(dev), **best_setting)
@@ -110,7 +118,7 @@ predictions_ratings = predictions.map(lambda x: ((x[0], x[1]), x[2]))\
       .values()
 metrics = RegressionMetrics(predictions_ratings)
 rmse = metrics.rootMeanSquaredError
-print rmse
+results.append('The rmse is {0}'.format(rmse))
 
 # Compute top-k ratings for each user
 # and discard users without atleast k ratings
@@ -125,80 +133,11 @@ topk_predictions_ratings = predictions.map(lambda x: ((x[0], x[1]), x[2]))\
       .values()
 topk_metrics = RegressionMetrics(topk_predictions_ratings)
 topk_rmse = topk_metrics.rootMeanSquaredError
-print topk_rmse
+results.append('The topk rmse is {0}'.format(topk_rmse))
 
+pickle.dump(to_pickle, \
+    open('to_pickle' + suffix, "wb"))
 
-
-
-
-
-
-
-
-
-
-means = item_user_map.map(lambda x: (x[0], (x[1][1], 1.0)))\
-    .reduceByKey(lambda x,y: ((x[0] + y[0]), (x[1] + y[1])))\
-    .map(lambda x: (x[0], x[1][0]/x[1][1]))
-
-# normalize item user ratings
-item_user_map = item_user_map.join(means)\
-    .map(lambda x: (x[0], (x[1][0][0], x[1][0][1] - x[1][1])))
-
-means = means.collectAsMap()
-interested_mean = means[interested_item]
-
-# Need to filter out users/items with zero variance i.e zero rows
-# But is not really necessary for now since they anyway would be 0 cosine
-
-norms = item_user_map.map(lambda x: (x[0], x[1][1] ** 2))\
-    .reduceByKey(add)\
-    .map(lambda x: (x[0], x[1] ** 0.5))
-norms = sc.broadcast(norms.collectAsMap())
-
-# maybe throw rows with 0 norms. they are zero variance. or rows with < some small epsilon
-
-interested_row = item_user_map.lookup(interested_item)
-interested_row = {u:r for (u, r) in interested_row}
-interested_row = sc.broadcast(interested_row)
-
-interested_norm = norms.value[interested_item]
-
-# compute cosine similarity scores for and get all valid neighbours
-# valid implies having >= 2 users in common 
-# and having cosine sim > 0
-scores = item_user_map.flatMap(\
-    lambda x: computeProductIntersection(x, interested_row.value))\
-    .reduceByKey(lambda x,y: ((x[0] + y[0]), (x[1] + y[1])))\
-    .filter(lambda x: x[1][1] >= 2)\
-    .map(lambda x: computeScore(x, norms.value, interested_norm))\
-    .filter(lambda x: x[1] > 0)
-
-scores = scores.collectAsMap()
-# With a target row, skip columns that do not have at least 2 neighbors
-
-# compute interested users rdd
-rated_users = sc.parallelize([(interested_item, None)])\
-    .join(item_user_map)\
-    .map(lambda x: (x[1][1][0], None))
-
-user_item_map = item_user_map.map(lambda x: ((x[1][0]), (x[0], x[1][1])))
-interested_user_ratings = user_item_map.subtractByKey(rated_users)
-predictions = interested_user_ratings.groupByKey()\
-    .flatMap(lambda x: predictScore(x, scores))\
-    .collect()
-
-full_row = [(i, r + interested_mean) for i, r in interested_row.value.items()]
-full_row = full_row + predictions
-
-
-pickle.dump(scores, \
-    open('scores' + suffix, "wb"))
-pickle.dump(predictions, \
-    open('predictions' + suffix, "wb"))
-pickle.dump(full_row, \
-    open('row' + suffix, "wb"))
-
-with open('output' + suffix, "wb") as f:
-    for item, rating in full_row:
-        f.write("{0} - {1}\n".format(item, rating))
+with open('results' + suffix, "wb") as f:
+    for line in results:
+        f.write(line + "\n")
