@@ -1,5 +1,6 @@
 import pickle
 import json
+import itertools
 from pyspark import SparkContext, StorageLevel
 from pyspark.mllib.recommendation import ALS
 from pyspark.mllib.evaluation import RegressionMetrics
@@ -9,11 +10,10 @@ from operator import add
 
 #input_file = 'reviews_Books.json.gz'
 input_file = 'sample_5p.json'
-interested_item = '0439023513'
 basename = path.basename(input_file)
 ts = str(int(time()))
 suffix = '_{0}_{1}'.format(basename, ts)
-sc = SparkContext(appName='Vj_CF' + suffix)
+sc = SparkContext(appName='CF_UI' + suffix)
 
 def extractRating(line):
     obj = json.loads(line)
@@ -21,40 +21,6 @@ def extractRating(line):
     item = obj['asin']
     rating = float(obj['overall'])
     return (item, (user, rating))
-
-def computeScore(tup, norms, interested_norm):
-    item, (dot, _) = tup
-    norm = norms[item]
-    # Can remove this check if we filter out things with 0 norm
-    if not norm:
-        return (x[0], 0)
-    return (item, dot/(norm * interested_norm))
-
-def computeProductIntersection(tup, interested_row):
-    item, (user, rating) = tup
-    try:
-        product = interested_row[user] * rating
-    except:
-        # user not in interested row
-        # no intersection and product is 0
-        return []
-    return [(item, (product, 1))]
-
-def predictScore(tup, scores):
-    user, item_ratings = tup
-    neighbour_ratings = []
-    for item, r in item_ratings:
-        if item in scores:
-            neighbour_ratings.append((scores[item], r))
-    if len(neighbour_ratings) < 2:
-        return []
-    # find the top 50 of these items based on their sim score and
-    # compute a weighted avg
-    neighbour_ratings.sort(reverse=True)
-    predicted_score = sum(rating * sim for (sim, rating) in neighbour_ratings[:50])
-    predicted_score /= sum(sim for (sim, _) in neighbour_ratings[:50])
-    predicted_score += interested_mean
-    return [(user, predicted_score)]
 
 # Have verified that there are not duplicate (item, user) ratings in the source data
 # So avoiding a distinct here to save on time
@@ -106,9 +72,36 @@ training, dev, test = ratings.randomSplit([7, 1, 2])
 
 # TODO: do another filtering to ensure that, there is enough data in training(+dev?) for every key, user in test 
 
-# TODO: optimize the hyperparams
-model = ALS.train(training, 10, 20, 1)
 
+# Optimize hyper-parameters using dev set 
+best_rmse, best_setting = 99999, None
+setting_log = []
+hyper_params = {
+    'rank':[5, 15, 25],
+    'iterations':[20],
+    'lambda_': [0.1, 1, 10.0]
+}
+params = []
+for param, vals in hyper_params.iteritems():
+    vals = [(param, val) for val in vals]
+    params.append(vals)
+for setting in itertools.product(*params):
+    setting = {k:v for k,v in setting}
+    model = ALS.train(training, **setting)
+    predictions = model.predictAll(dev.map(lambda x: (x[0], x[1])))
+    predictions_ratings = predictions.map(lambda x: ((x[0], x[1]), x[2])) \
+          .join(dev.map(lambda x: ((x[0], x[1]), x[2]))) \
+          .values()
+    rmse = RegressionMetrics(predictions_ratings).rootMeanSquaredError
+
+    setting_log.append((setting, rmse))
+    if rmse < best_rmse:
+        best_rmse = rmse
+        best_setting = setting
+
+# Train a new model using the best hyper-param setting and
+# using combined training + dev data as the new training data
+model = ALS.train(training.union(dev), **best_setting)
 predictions = model.predictAll(test.map(lambda x: (x[0], x[1])))
 
 predictions_ratings = predictions.map(lambda x: ((x[0], x[1]), x[2])) \
