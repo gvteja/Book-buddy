@@ -17,6 +17,10 @@ suffix = '_{0}_{1}'.format(basename, ts)
 #sc = SparkContext(appName='CF_UI' + suffix)
 
 def extractRating(line):
+    '''
+    Given a rating json object string, parse it and
+    return (item, (user, rating))
+    '''
     obj = json.loads(line)
     user = obj['reviewerID']
     item = obj['asin']
@@ -28,11 +32,13 @@ def extractRating(line):
 rdd = sc.textFile(input_file, minPartitions=8)
 item_user_map = rdd.map(extractRating)
 
+# Filter out items with less than 25 reviews from users
 items_to_remove = item_user_map.map(lambda x: (x[0], 1))\
     .reduceByKey(add)\
     .filter(lambda x: x[1] < 25)
 item_user_map = item_user_map.subtractByKey(items_to_remove)
 
+# Filter out users who have rated less than 10 items
 user_item_map = item_user_map.map(lambda x: ((x[1][0]), (x[0], x[1][1])))
 users_to_remove = user_item_map.map(lambda x: (x[0], (x[1][1], 1)))\
     .reduceByKey(add)\
@@ -74,7 +80,7 @@ training, dev, test = ratings.randomSplit([7, 1, 2])
 # TODO: do another filtering to ensure that, there is enough data in training(+dev?) for every key, user in test 
 
 
-# Optimize hyper-parameters using dev set 
+# Candidate values for different hyper-parameter to choose from
 best_rmse, best_setting = 99999, None
 setting_log = []
 hyper_params = {
@@ -86,6 +92,9 @@ params = []
 for param, vals in hyper_params.iteritems():
     vals = [(param, val) for val in vals]
     params.append(vals)
+
+# Build a model with each combination of hyper-parameters
+# and choose the one with best rmse on the dev set
 for setting in itertools.product(*params):
     setting = {k:v for k,v in setting}
     model = ALS.train(training, **setting)
@@ -113,6 +122,8 @@ results = []
 model = ALS.train(training.union(dev), **best_setting)
 predictions = model.predictAll(test.map(lambda x: (x[0], x[1])))
 
+# Calculate rmse using the predicted rating and actual ratings
+# on the test set
 predictions_ratings = predictions.map(lambda x: ((x[0], x[1]), x[2]))\
       .join(test.map(lambda x: ((x[0], x[1]), x[2])))\
       .values()
@@ -128,6 +139,7 @@ topk = test.map(lambda x: (x[0], [(x[2], x[1])]))\
     .map(lambda x: (x[0], sorted(x[1], reverse=True)[:k]))\
     .flatMap(lambda x: [((x[0], t[1]), t[0]) for t in x[1]])
 
+# Compute rmse on the top k predictions/user
 topk_predictions_ratings = predictions.map(lambda x: ((x[0], x[1]), x[2]))\
       .join(topk)\
       .values()
@@ -135,9 +147,11 @@ topk_metrics = RegressionMetrics(topk_predictions_ratings)
 topk_rmse = topk_metrics.rootMeanSquaredError
 results.append('The topk rmse is {0}'.format(topk_rmse))
 
+# Dump debug data to file
 pickle.dump(to_pickle, \
     open('to_pickle' + suffix, "wb"))
 
+# Write result strings to file
 with open('results' + suffix, "wb") as f:
     for line in results:
         f.write(line + "\n")
