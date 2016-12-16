@@ -4,6 +4,7 @@ import itertools
 from pyspark import SparkContext
 from pyspark.mllib.recommendation import ALS
 from pyspark.mllib.evaluation import RegressionMetrics
+from math import sqrt
 from os import path
 from time import time
 from operator import add
@@ -11,6 +12,10 @@ from operator import add
 #input_file = 'reviews_Books.json.gz'
 input_file = 'sample_5p.json'
 k = 5
+# Store all the things we want to pickle in this list
+to_pickle = []
+# Store all the info we want to print into results
+results = []
 basename = path.basename(input_file)
 ts = str(int(time()))
 suffix = '_{0}_{1}'.format(basename, ts)
@@ -29,7 +34,7 @@ def extractRating(line):
 
 # Have verified that there are not duplicate (item, user) ratings in the source data
 # So avoiding a distinct here to save on time
-rdd = sc.textFile(input_file, minPartitions=8)
+rdd = sc.textFile(input_file).repartition(sc.defaultParallelism * 4)
 item_user_map = rdd.map(extractRating)
 
 # Filter out items with less than 25 reviews from users
@@ -75,9 +80,55 @@ users = None
 ratings = item_user_map.map(lambda x:\
     (user_ids.value[x[1][0]], item_ids.value[x[0]], x[1][1]))
 
-training, dev, test = ratings.randomSplit([7, 1, 2])
+#ratings = ratings.map(lambda x: (x[1], x[0], x[2]))
+training, dev, test = ratings.randomSplit([7, 1, 2], seed=590)
+training.cache()
+dev.cache()
+training_dev = training.union(dev).cache()
 
-# TODO: do another filtering to ensure that, there is enough data in training(+dev?) for every key, user in test 
+# Compute user bias and global mean using training + dev data
+user_ratings_sum = training_dev.map(lambda x: (x[0], (x[2], 1)))\
+    .reduceByKey(lambda x,y: (x[0]+y[0], x[1]+y[1]))
+
+sum_training_ratings, num_training_ratings = user_ratings_sum.values()\
+    .reduce(lambda x,y: (x[0]+y[0], x[1]+y[1]))
+global_training_mean = sum_training_ratings/num_training_ratings
+results.append('The global mean is: {0}'.format(global_training_mean))
+
+user_bias = user_ratings_sum.map(lambda x: 
+    (x[0], (x[1][0] - global_training_mean * x[1][1]) / x[1][1]))\
+    .collectAsMap()
+user_bias = sc.broadcast(user_bias)
+
+# Compute item bias using training + dev data
+item_bias = training_dev.map(lambda x:\
+    (x[1], (x[2] - global_training_mean - user_bias.value[x[0]], 1)))\
+    .reduceByKey(lambda x,y: (x[0]+y[0], x[1]+y[1]))\
+    .map(lambda x: (x[0], x[1][0]/x[1][1]))\
+    .collectAsMap()
+item_bias = sc.broadcast(item_bias)
+
+# Filter out test data where user/item is not in training data
+test = test.filter(lambda x:\
+    (x[0] in user_bias.value) and (x[1] in item_bias.value))\
+    .cache()
+
+# Weak baseline predictions
+weak_baseline_mse = test.map(lambda x: (x[2] - global_training_mean)**2)\
+    .mean()
+results.append('Weak baseline rmse is {0}'.format(sqrt(weak_baseline_mse)))
+
+# Strong baseline predictions
+strong_baseline_mse = test.map(lambda x:\
+    (x[2] - global_training_mean - user_bias.value[x[0]] - item_bias.value[x[1]])**2)\
+    .mean()
+results.append('Strong baseline rmse is {0}'.format(sqrt(strong_baseline_mse)))
+
+# TODO: do another filtering to ensure that, there is enough data in training(+dev?) for every item, user in test 
+# the predictall function ignores items/users for which we there is no rating in training
+# but our baselines cannot handle that
+# also keep this in mind when picking dev set too
+# shouuld we make sure we remove stuff from dev set too?
 
 
 # Candidate values for different hyper-parameter to choose from
@@ -93,7 +144,7 @@ for param, vals in hyper_params.iteritems():
     vals = [(param, val) for val in vals]
     params.append(vals)
 
-# Build a model with each combination of hyper-parameters
+# Build a user-user model with each combination of hyper-parameters
 # and choose the one with best rmse on the dev set
 for setting in itertools.product(*params):
     setting = {k:v for k,v in setting}
@@ -109,17 +160,12 @@ for setting in itertools.product(*params):
         best_rmse = rmse
         best_setting = setting
 
-# Store all the things we want to pickle in this list
-to_pickle = []
 to_pickle.append(setting_log)
 to_pickle.append(best_setting)
 
-# Store all the info we want to print into results
-results = []
-
 # Train a new model using the best hyper-param setting and
 # using combined training + dev data as the new training data
-model = ALS.train(training.union(dev), **best_setting)
+model = ALS.train(training_dev, **best_setting)
 predictions = model.predictAll(test.map(lambda x: (x[0], x[1])))
 
 # Calculate rmse using the predicted rating and actual ratings
@@ -129,23 +175,36 @@ predictions_ratings = predictions.map(lambda x: ((x[0], x[1]), x[2]))\
       .values()
 metrics = RegressionMetrics(predictions_ratings)
 rmse = metrics.rootMeanSquaredError
-results.append('The rmse is {0}'.format(rmse))
+results.append('The user-user rmse is {0}'.format(rmse))
 
 # Compute top-k ratings for each user
 # and discard users without atleast k ratings
-topk = test.map(lambda x: (x[0], [(x[2], x[1])]))\
+topk_ratings = test.map(lambda x: (x[0], [(x[2], x[1])]))\
     .reduceByKey(lambda x,y: x+y)\
     .filter(lambda x: len(x[1]) >= k)\
-    .map(lambda x: (x[0], sorted(x[1], reverse=True)[:k]))\
+    .map(lambda x: (x[0], sorted(x[1], reverse=True)[:k]))
+
+topk_ratings_flattened = topk_ratings\
     .flatMap(lambda x: [((x[0], t[1]), t[0]) for t in x[1]])
 
 # Compute rmse on the top k predictions/user
 topk_predictions_ratings = predictions.map(lambda x: ((x[0], x[1]), x[2]))\
-      .join(topk)\
+      .join(topk_ratings_flattened)\
       .values()
 topk_metrics = RegressionMetrics(topk_predictions_ratings)
 topk_rmse = topk_metrics.rootMeanSquaredError
-results.append('The topk rmse is {0}'.format(topk_rmse))
+results.append('The user-user topk rmse is {0}'.format(topk_rmse))
+
+# Compute top-k predictions for each user
+# and discard users without atleast k ratings
+topk_predictions = predictions.map(lambda x: (x[0], [(x[2], x[1])]))\
+    .reduceByKey(lambda x,y: x+y)\
+    .filter(lambda x: len(x[1]) >= k)\
+    .map(lambda x: (x[0], sorted(x[1], reverse=True)[:k]))
+
+#topk_ratings.leftOuterJoin(topk_predictions)
+
+
 
 # Dump debug data to file
 pickle.dump(to_pickle, \
