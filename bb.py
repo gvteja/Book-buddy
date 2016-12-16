@@ -9,8 +9,9 @@ from os import path
 from time import time
 from operator import add
 
-#input_file = 'reviews_Books.json.gz'
-input_file = 'sample_5p.json'
+input_file = 's3://bd-cluster-e/reviews_Books_5.json.gz'
+#input_file = 's3://bd-cluster-e/sample_5p.json'
+checkpoint_dir = 's3://bd-cluster-e/checkpoints'
 k = 5
 # Store all the things we want to pickle in this list
 to_pickle = []
@@ -20,6 +21,8 @@ basename = path.basename(input_file)
 ts = str(int(time()))
 suffix = '_{0}_{1}'.format(basename, ts)
 #sc = SparkContext(appName='CF_UI' + suffix)
+# Set checkpoint dir to avoid long lineage
+sc.setCheckpointDir(checkpoint_dir)
 
 def extractRating(line):
     '''
@@ -108,9 +111,26 @@ item_bias = training_dev.map(lambda x:\
     .collectAsMap()
 item_bias = sc.broadcast(item_bias)
 
-# Filter out test data where user/item is not in training data
+# Filter out test data where user/item is not in training/dev data
 test = test.filter(lambda x:\
     (x[0] in user_bias.value) and (x[1] in item_bias.value))\
+    .cache()
+
+# Build set of users in training data
+training_users = training.map(lambda x: x[0])\
+    .distinct()\
+    .collect()
+training_users = sc.broadcast(set(training_users))
+
+# Build set of items in training data
+training_items = training.map(lambda x: x[1])\
+    .distinct()\
+    .collect()
+training_items = sc.broadcast(set(training_items))
+
+# Filter out dev data where user/item is not in training data
+dev_filtered = dev.filter(lambda x:\
+    (x[0] in training_users.value) and (x[1] in training_items.value))\
     .cache()
 
 # Weak baseline predictions
@@ -162,13 +182,13 @@ for param, vals in hyper_params.iteritems():
     params.append(vals)
 
 # Build a user-user model with each combination of hyper-parameters
-# and choose the one with best rmse on the dev set
+# and choose the one with best rmse on the dev_filtered set
 for setting in itertools.product(*params):
     setting = {k:v for k,v in setting}
     model = ALS.train(training, **setting)
-    predictions = model.predictAll(dev.map(lambda x: (x[0], x[1])))
+    predictions = model.predictAll(dev_filtered.map(lambda x: (x[0], x[1])))
     predictions_ratings = predictions.map(lambda x: ((x[0], x[1]), x[2]))\
-          .join(dev.map(lambda x: ((x[0], x[1]), x[2])))\
+          .join(dev_filtered.map(lambda x: ((x[0], x[1]), x[2])))\
           .values()
     rmse = RegressionMetrics(predictions_ratings).rootMeanSquaredError
 
@@ -212,3 +232,9 @@ pickle.dump(to_pickle, \
 with open('results' + suffix, "wb") as f:
     for line in results:
         f.write(line + "\n")
+
+
+# TODO: Build normalized rating using user and item biases
+normalized = test.map(lambda x:\
+    (x[2] - global_training_mean - user_bias.value[x[0]] - item_bias.value[x[1]])**2)\
+    .mean()
