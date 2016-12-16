@@ -124,12 +124,29 @@ strong_baseline_mse = test.map(lambda x:\
     .mean()
 results.append('Strong baseline rmse is {0}'.format(sqrt(strong_baseline_mse)))
 
-# TODO: do another filtering to ensure that, there is enough data in training(+dev?) for every item, user in test 
-# the predictall function ignores items/users for which we there is no rating in training
-# but our baselines cannot handle that
-# also keep this in mind when picking dev set too
-# shouuld we make sure we remove stuff from dev set too?
+# Compute top-k ratings for each user
+topk_ratings = test.map(lambda x: (x[0], [(x[2], x[1])]))\
+    .reduceByKey(lambda x,y: x+y)\
+    .map(lambda x: (x[0], sorted(x[1], reverse=True)[:k]))\
+    .cache()
 
+topk_ratings_flattened = topk_ratings\
+    .flatMap(lambda x: [((x[0], t[1]), t[0]) for t in x[1]])\
+    .cache()
+
+# Compute top-k rmse for weak baseline
+wb_topk_mse = topk_ratings_flattened.map(lambda ((u,i),r):\
+    (r - global_training_mean)**2)\
+    .mean()
+results.append('Weak baseline topk rmse is {0}'.format(sqrt(wb_topk_mse)))
+
+# Compute top-k rmse for strong baseline
+sb_topk_mse = topk_ratings_flattened.map(lambda ((u,i),r):\
+    (r - global_training_mean - user_bias.value[u] - item_bias.value[i])**2)\
+    .mean()
+results.append('Strong baseline topk rmse is {0}'.format(sqrt(sb_topk_mse)))
+
+# TODO: maybe normalize the ratings using strong baseline to improve cb
 
 # Candidate values for different hyper-parameter to choose from
 best_rmse, best_setting = 99999, None
@@ -177,16 +194,6 @@ metrics = RegressionMetrics(predictions_ratings)
 rmse = metrics.rootMeanSquaredError
 results.append('The user-user rmse is {0}'.format(rmse))
 
-# Compute top-k ratings for each user
-# and discard users without atleast k ratings
-topk_ratings = test.map(lambda x: (x[0], [(x[2], x[1])]))\
-    .reduceByKey(lambda x,y: x+y)\
-    .filter(lambda x: len(x[1]) >= k)\
-    .map(lambda x: (x[0], sorted(x[1], reverse=True)[:k]))
-
-topk_ratings_flattened = topk_ratings\
-    .flatMap(lambda x: [((x[0], t[1]), t[0]) for t in x[1]])
-
 # Compute rmse on the top k predictions/user
 topk_predictions_ratings = predictions.map(lambda x: ((x[0], x[1]), x[2]))\
       .join(topk_ratings_flattened)\
@@ -195,16 +202,7 @@ topk_metrics = RegressionMetrics(topk_predictions_ratings)
 topk_rmse = topk_metrics.rootMeanSquaredError
 results.append('The user-user topk rmse is {0}'.format(topk_rmse))
 
-# Compute top-k predictions for each user
-# and discard users without atleast k ratings
-topk_predictions = predictions.map(lambda x: (x[0], [(x[2], x[1])]))\
-    .reduceByKey(lambda x,y: x+y)\
-    .filter(lambda x: len(x[1]) >= k)\
-    .map(lambda x: (x[0], sorted(x[1], reverse=True)[:k]))
-
-#topk_ratings.leftOuterJoin(topk_predictions)
-
-
+# TODO: item-item cb
 
 # Dump debug data to file
 pickle.dump(to_pickle, \
