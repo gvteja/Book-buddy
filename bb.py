@@ -12,6 +12,9 @@ from operator import add
 input_file = 's3://bd-cluster-e/reviews_Books_5.json.gz'
 #input_file = 's3://bd-cluster-e/sample_5p.json'
 checkpoint_dir = 's3://bd-cluster-e/checkpoints'
+#input_file = 'gs://bd_bucket/sample_5p.json'
+#checkpoint_dir = 'gs://bd_bucket/checkpoints'
+
 k = 5
 # Store all the things we want to pickle in this list
 to_pickle = []
@@ -39,6 +42,7 @@ def extractRating(line):
 # So avoiding a distinct here to save on time
 rdd = sc.textFile(input_file).repartition(sc.defaultParallelism * 4)
 item_user_map = rdd.map(extractRating)
+#item_user_map = item_user_map.sample(False, 0.75, seed=55)
 
 # Filter out items with less than 25 reviews from users
 items_to_remove = item_user_map.map(lambda x: (x[0], 1))\
@@ -273,6 +277,124 @@ ii_topk_predictions_ratings = ii_predictions.map(lambda x: ((x[1], x[0]), x[2]))
 ii_topk_rmse = RegressionMetrics(ii_topk_predictions_ratings).rootMeanSquaredError
 results.append('The item-item topk rmse is {0}'.format(ii_topk_rmse))
 
+
+# NORMALIZED COLLOBARATIVE FILTERING MODELS
+# Undo the interchange of user and item positions and build
+# normalized rating using user and item biases
+training_dev = training_dev.map(lambda (i,u,r): (u, i,\
+    (r - global_training_mean - user_bias.value[u] - item_bias.value[i])))\
+    .cache()
+training = training.map(lambda (i,u,r): (u, i,\
+    (r - global_training_mean - user_bias.value[u] - item_bias.value[i])))\
+    .cache()
+
+# Trigger computation of training and training_dev to avoid 
+# race condition
+training.count()
+training_dev.count()
+
+
+# Normalized USER - USER normalized
+uu_best_rmse, uu_best_setting = 99999, None
+uu_setting_log = []
+# Build a normalized user-user model with each combination of hyper-parameters
+# and choose the one with best rmse on the dev_filtered set
+for setting in itertools.product(*params):
+    setting = {k:v for k,v in setting}
+    model = ALS.train(training, **setting)
+    predictions = model.predictAll(dev_filtered.map(lambda (u,i,r): (u, i)))
+    predictions_ratings = predictions.map(lambda (u,i,r): ((u, i), (r + global_training_mean + user_bias.value[u] + item_bias.value[i])))\
+          .join(dev_filtered.map(lambda (u,i,r): ((u, i), r)))\
+          .values()
+    rmse = RegressionMetrics(predictions_ratings).rootMeanSquaredError
+
+    uu_setting_log.append((setting, rmse))
+    if rmse < uu_best_rmse:
+        uu_best_rmse = rmse
+        uu_best_setting = setting
+
+to_pickle.append(uu_setting_log)
+to_pickle.append(uu_best_setting)
+results.append('The best setting for normalized user-user model is {0}'.format(uu_best_setting))
+
+# Train a new normalized user-user model using the best hyper-param setting and
+# using combined training + dev data as the new training data
+uu_model = ALS.train(training_dev, **uu_best_setting)
+uu_predictions = uu_model.predictAll(test.map(lambda x: (x[0], x[1])))\
+    .map(lambda (u,i,r): ((u, i), (r + global_training_mean + user_bias.value[u] + item_bias.value[i])))
+
+# Calculate rmse using the predicted rating and actual ratings
+# on the test set
+uu_predictions_ratings = uu_predictions.join(test.map(lambda (u,i,r): ((u, i), r)))\
+      .values()
+uu_rmse = RegressionMetrics(uu_predictions_ratings).rootMeanSquaredError
+results.append('The normalized user-user rmse is {0}'.format(uu_rmse))
+
+# Compute rmse on the top k predictions/user
+uu_topk_predictions_ratings = uu_predictions.join(topk_ratings_flattened)\
+      .values()
+uu_topk_rmse = RegressionMetrics(uu_topk_predictions_ratings).rootMeanSquaredError
+results.append('The normalized user-user topk rmse is {0}'.format(uu_topk_rmse))
+
+
+# ITEM - ITEM normalized model
+# Interchange user and item positions i.e. rows and columns
+# in both training and combined training + dev set
+training = training.map(lambda x: (x[1], x[0], x[2])).cache()
+training_dev = training_dev.map(lambda x: (x[1], x[0], x[2])).cache()
+ii_best_rmse, ii_best_setting = 99999, None
+ii_setting_log = []
+
+# Trigger computation of training and training_dev to avoid 
+# race condition like before
+training.count()
+training_dev.count()
+
+# Build an item-item model with each combination of hyper-parameters
+# and choose the one with best rmse on the dev_filtered set
+for setting in itertools.product(*params):
+    setting = {k:v for k,v in setting}
+    model = ALS.train(training, **setting)
+    predictions = model.predictAll(dev_filtered.map(lambda (u,i,r): (i, u)))
+    predictions_ratings = predictions.map(lambda (i,u,r): ((u, i), (r + global_training_mean + user_bias.value[u] + item_bias.value[i])))\
+          .join(dev_filtered.map(lambda (u,i,r): ((u, i), r)))\
+          .values()
+    rmse = RegressionMetrics(predictions_ratings).rootMeanSquaredError
+
+    ii_setting_log.append((setting, rmse))
+    if rmse < ii_best_rmse:
+        ii_best_rmse = rmse
+        ii_best_setting = setting
+
+to_pickle.append(ii_setting_log)
+to_pickle.append(ii_best_setting)
+results.append('The best setting for normalized item-item model is {0}'.format(ii_best_setting))
+
+# Train a new item-item model using the best hyper-param setting and
+# using combined training + dev data as the new training data
+ii_model = ALS.train(training_dev, **ii_best_setting)
+ii_predictions = ii_model.predictAll(test.map(lambda x: (x[1], x[0])))\
+    .map(lambda (i,u,r): ((u, i), (r + global_training_mean + user_bias.value[u] + item_bias.value[i])))
+
+# Calculate item-item rmse using the predicted rating and actual ratings
+# on the test set
+ii_predictions_ratings = ii_predictions.join(test.map(lambda (u,i,r): ((u, i), r)))\
+      .values()
+ii_rmse = RegressionMetrics(ii_predictions_ratings).rootMeanSquaredError
+results.append('The normalized item-item rmse is {0}'.format(ii_rmse))
+
+# Compute item-item rmse on the top k predictions/user
+ii_topk_predictions_ratings = ii_predictions.join(topk_ratings_flattened)\
+      .values()
+ii_topk_rmse = RegressionMetrics(ii_topk_predictions_ratings).rootMeanSquaredError
+results.append('The normalized item-item topk rmse is {0}'.format(ii_topk_rmse))
+
+
+results.append('The number of ratings are {0}'.format(rdd.count()))
+results.append('The number of filtered ratings are {0}'.format(ratings.count()))
+results.append('The number of filtered users are {0}'.format(len(user_ids.value)))
+results.append('The number of filtered items are {0}'.format(len(item_ids.value)))
+
 # Dump debug data to file
 pickle.dump(to_pickle, \
     open('to_pickle' + suffix, "wb"))
@@ -281,11 +403,3 @@ pickle.dump(to_pickle, \
 with open('results' + suffix, "wb") as f:
     for line in results:
         f.write(line + "\n")
-
-# TODO: Build normalized rating using user and item biases
-# Interchange user and item positions again for 
-training = training.map(lambda x: (x[1], x[0], x[2])).cache()
-training_dev = training_dev.map(lambda x: (x[1], x[0], x[2])).cache()
-normalized = test.map(lambda x:\
-    (x[2] - global_training_mean - user_bias.value[x[0]] - item_bias.value[x[1]])**2)\
-    .mean()
