@@ -83,7 +83,6 @@ users = None
 ratings = item_user_map.map(lambda x:\
     (user_ids.value[x[1][0]], item_ids.value[x[0]], x[1][1]))
 
-#ratings = ratings.map(lambda x: (x[1], x[0], x[2]))
 training, dev, test = ratings.randomSplit([7, 1, 2], seed=590)
 training.cache()
 dev.cache()
@@ -166,11 +165,7 @@ sb_topk_mse = topk_ratings_flattened.map(lambda ((u,i),r):\
     .mean()
 results.append('Strong baseline topk rmse is {0}'.format(sqrt(sb_topk_mse)))
 
-# TODO: maybe normalize the ratings using strong baseline to improve cb
-
-# Candidate values for different hyper-parameter to choose from
-best_rmse, best_setting = 99999, None
-setting_log = []
+# Candidate values for different hyper-parameters in ALS
 hyper_params = {
     'rank':[5, 15, 25],
     'iterations':[20],
@@ -181,6 +176,9 @@ for param, vals in hyper_params.iteritems():
     vals = [(param, val) for val in vals]
     params.append(vals)
 
+# USER - USER model
+uu_best_rmse, uu_best_setting = 99999, None
+uu_setting_log = []
 # Build a user-user model with each combination of hyper-parameters
 # and choose the one with best rmse on the dev_filtered set
 for setting in itertools.product(*params):
@@ -192,37 +190,88 @@ for setting in itertools.product(*params):
           .values()
     rmse = RegressionMetrics(predictions_ratings).rootMeanSquaredError
 
-    setting_log.append((setting, rmse))
-    if rmse < best_rmse:
-        best_rmse = rmse
-        best_setting = setting
+    uu_setting_log.append((setting, rmse))
+    if rmse < uu_best_rmse:
+        uu_best_rmse = rmse
+        uu_best_setting = setting
 
-to_pickle.append(setting_log)
-to_pickle.append(best_setting)
+to_pickle.append(uu_setting_log)
+to_pickle.append(uu_best_setting)
+results.append('The best setting for user-user model is {0}'.format(uu_best_setting))
 
-# Train a new model using the best hyper-param setting and
+# Train a new user-user model using the best hyper-param setting and
 # using combined training + dev data as the new training data
-model = ALS.train(training_dev, **best_setting)
-predictions = model.predictAll(test.map(lambda x: (x[0], x[1])))
+uu_model = ALS.train(training_dev, **uu_best_setting)
+uu_predictions = uu_model.predictAll(test.map(lambda x: (x[0], x[1])))
 
 # Calculate rmse using the predicted rating and actual ratings
 # on the test set
-predictions_ratings = predictions.map(lambda x: ((x[0], x[1]), x[2]))\
+uu_predictions_ratings = uu_predictions.map(lambda x: ((x[0], x[1]), x[2]))\
       .join(test.map(lambda x: ((x[0], x[1]), x[2])))\
       .values()
-metrics = RegressionMetrics(predictions_ratings)
-rmse = metrics.rootMeanSquaredError
-results.append('The user-user rmse is {0}'.format(rmse))
+uu_rmse = RegressionMetrics(uu_predictions_ratings).rootMeanSquaredError
+results.append('The user-user rmse is {0}'.format(uu_rmse))
 
 # Compute rmse on the top k predictions/user
-topk_predictions_ratings = predictions.map(lambda x: ((x[0], x[1]), x[2]))\
+uu_topk_predictions_ratings = uu_predictions.map(lambda x: ((x[0], x[1]), x[2]))\
       .join(topk_ratings_flattened)\
       .values()
-topk_metrics = RegressionMetrics(topk_predictions_ratings)
-topk_rmse = topk_metrics.rootMeanSquaredError
-results.append('The user-user topk rmse is {0}'.format(topk_rmse))
+uu_topk_rmse = RegressionMetrics(uu_topk_predictions_ratings).rootMeanSquaredError
+results.append('The user-user topk rmse is {0}'.format(uu_topk_rmse))
 
-# TODO: item-item cb
+
+# ITEM - ITEM model
+# Interchange user and item positions i.e. rows and columns
+# in both training and combined training + dev set
+training = training.map(lambda x: (x[1], x[0], x[2])).cache()
+training_dev = training_dev.map(lambda x: (x[1], x[0], x[2])).cache()
+ii_best_rmse, ii_best_setting = 99999, None
+ii_setting_log = []
+
+# Trigger computation of training and training_dev to avoid 
+# race condition and incorrectly using old training and training_dev
+training.count()
+training_dev.count()
+
+# Build an item-item model with each combination of hyper-parameters
+# and choose the one with best rmse on the dev_filtered set
+for setting in itertools.product(*params):
+    setting = {k:v for k,v in setting}
+    model = ALS.train(training, **setting)
+    predictions = model.predictAll(dev_filtered.map(lambda x: (x[1], x[0])))
+    predictions_ratings = predictions.map(lambda x: ((x[1], x[0]), x[2]))\
+          .join(dev_filtered.map(lambda x: ((x[0], x[1]), x[2])))\
+          .values()
+    rmse = RegressionMetrics(predictions_ratings).rootMeanSquaredError
+
+    ii_setting_log.append((setting, rmse))
+    if rmse < ii_best_rmse:
+        ii_best_rmse = rmse
+        ii_best_setting = setting
+
+to_pickle.append(ii_setting_log)
+to_pickle.append(ii_best_setting)
+results.append('The best setting for item-item model is {0}'.format(ii_best_setting))
+
+# Train a new item-item model using the best hyper-param setting and
+# using combined training + dev data as the new training data
+ii_model = ALS.train(training_dev, **ii_best_setting)
+ii_predictions = ii_model.predictAll(test.map(lambda x: (x[1], x[0])))
+
+# Calculate item-item rmse using the predicted rating and actual ratings
+# on the test set
+ii_predictions_ratings = ii_predictions.map(lambda x: ((x[1], x[0]), x[2]))\
+      .join(test.map(lambda x: ((x[0], x[1]), x[2])))\
+      .values()
+ii_rmse = RegressionMetrics(ii_predictions_ratings).rootMeanSquaredError
+results.append('The item-item rmse is {0}'.format(ii_rmse))
+
+# Compute item-item rmse on the top k predictions/user
+ii_topk_predictions_ratings = ii_predictions.map(lambda x: ((x[1], x[0]), x[2]))\
+      .join(topk_ratings_flattened)\
+      .values()
+ii_topk_rmse = RegressionMetrics(ii_topk_predictions_ratings).rootMeanSquaredError
+results.append('The item-item topk rmse is {0}'.format(ii_topk_rmse))
 
 # Dump debug data to file
 pickle.dump(to_pickle, \
@@ -233,8 +282,10 @@ with open('results' + suffix, "wb") as f:
     for line in results:
         f.write(line + "\n")
 
-
 # TODO: Build normalized rating using user and item biases
+# Interchange user and item positions again for 
+training = training.map(lambda x: (x[1], x[0], x[2])).cache()
+training_dev = training_dev.map(lambda x: (x[1], x[0], x[2])).cache()
 normalized = test.map(lambda x:\
     (x[2] - global_training_mean - user_bias.value[x[0]] - item_bias.value[x[1]])**2)\
     .mean()
